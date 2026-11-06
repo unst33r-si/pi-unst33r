@@ -1,0 +1,38 @@
+{
+  "name": "@unst33r/pi",
+  "version": "0.1.0",
+  "description": "UNST33R API provider for the pi coding agent — uncensored & abliterated models in /model",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "llm-api",
+    "uncensored",
+    "ai-security"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unst33r-si/pi-unst33r.git"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/*.ts"
+    ],
+    "skills": [
+      "skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
