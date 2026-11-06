@@ -45,14 +45,21 @@ Send one minimal request to the cheapest capable tier (`unst33r-flash`):
 ```bash
 curl -s --max-time 120 https://api.unst33r.si/v1/chat/completions \
   -H "Authorization: Bearer $UNST33R_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"unst33r-flash","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_tokens":2000}'
+  -d '{"model":"unst33r-flash","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_completion_tokens":2000}'
 ```
 
-Expected: `choices[0].message.content` containing "OK" and a `usage` object.
+Expected: `choices[0].message.content` containing "OK" (plus `reasoning_content` on reasoning tiers) and a `usage` object.
 
-- `model_not_found` / `"No available channel ... under group default"` → the gateway currently has no upstream channel bound for this key's group. This is server-side; nothing in the client config fixes it. Report it and suggest retrying later or contacting UNST33R support via the console.
+Gateway quirks to keep in mind (verified 2026-11-06, see the package README's Compat section for the full list):
+
+- Use `max_completion_tokens`, never `max_tokens` (the legacy spelling is rejected).
+- Keep message content as plain strings; array-of-blocks content is rejected.
+- Space requests ~10s apart — rapid-fire requests can trip the middleware (`503 intent_rejected`) even for valid bodies.
+
+- `model_not_found` / `"No available channel ... under group default"` / `intent_rejected` / `"Inference temporarily unavailable"` → these 503 signatures come from the gateway middleware and alternate between two shapes. They mean either (a) the request contains a parameter or content shape the middleware rejects (see quirks above and the README Compat section), or (b) a temporary server-side condition. Try a minimal body first (`model` + plain-string `messages` only); if that passes, the rejected request's shape is at fault, not the channel.
+- HTTP 400 `upstream_error` on `unst33r-deepseek` → the tier's upstream is failing; report and move on.
 - HTTP 400 with a field name → request-shape issue; report the exact error body.
-- HTTP 429/5xx → temporary upstream errors per the official docs; retry once after ~30s.
+- HTTP 429/5xx (other) → temporary upstream errors per the official docs; retry once after ~30s.
 
 If Step 3 succeeds, also run the fuller compatibility probe (optional but recommended):
 

@@ -2,76 +2,105 @@
  * pi-unst33r — UNST33R API provider for the pi coding agent.
  *
  * Registers https://api.unst33r.si/v1 (OpenAI Chat Completions behind a New API
- * gateway) as provider "unst33r" with a static model catalog.
+ * gateway with a strict request middleware) as provider "unst33r" with a static
+ * model catalog.
  *
- * Metadata sources & verification status (2026-11-06):
+ * Metadata sources & verification status (live-probed 2026-11-06, ~18:30 UTC):
  * - Pricing: official pricing page, catalog version 2026-10-15-launch-v1
  *   (https://unst33r.si/pricing).
  * - Context windows / max output: derived from pi's own catalog entries for the
- *   same upstream models (GLM-5.3 / GLM-5.3-Flash / DeepSeek-V4-Flash) and NOT
- *   yet confirmed end-to-end through the gateway — see compat notes below and
- *   scripts/check-compat.sh.
- * - Compatibility flags: from the official API docs (https://unst33r.si/docs).
- *   Live completion-level probes were blocked on 2026-11-06 by a gateway-side
- *   channel outage ("No available channel ... under group default"), so flags
- *   marked (docs) rest on official documentation, and flags marked
- *   (conservative) are deliberately pessimistic until re-verified with
- *   scripts/check-compat.sh.
+ *   same upstream models (GLM-5.3 / GLM-5.3-Flash / DeepSeek-V4-Flash); NOT yet
+ *   confirmed end-to-end through the gateway.
+ * - Compatibility flags: verified against the live gateway with spaced single
+ *   probes (rapid bursts trip a rate middleware that answers 503
+ *   `intent_rejected` — space requests ~10s apart). Confirmed with
+ *   scripts/check-compat.sh and manual probes:
  *
- * API-level facts from the official docs:
- * - Text Chat Completions only. No Responses API, no structured outputs
- *   (json_schema), no images/audio/embeddings, no sampling controls
- *   (temperature/top_p are outside the supported range).
- * - Set max_tokens OR max_completion_tokens, never both. If neither is set the
- *   server defaults the output limit to 512 tokens.
- * - reasoning_effort: unst33r-flash / unst33r-pro accept omitted | low | high |
- *   max; unst33r-deepseek additionally accepts off. Other values are rejected
- *   (HTTP 400), not silently clamped.
- * - unst33r-deepseek currently accepts non-streaming text only: SSE and tool
- *   calls are NOT enabled for it, so it cannot drive pi's agentic coding loop.
- * - unst33r-flash / unst33r-pro: streaming requires usage reporting; the server
- *   adds stream_options.include_usage=true itself when omitted. Their tool
- *   profile is limited to ONE explicitly selected function with flat string
- *   arguments at reasoning_effort=low — full multi-tool agentic use may be
- *   degraded; verify with scripts/check-compat.sh before relying on it.
+ *   ACCEPTED (HTTP 200):
+ *   - system role; bare and with max_completion_tokens
+ *   - max_completion_tokens (use this; max_tokens is REJECTED, see below)
+ *   - reasoning_effort low / high / max on flash & pro (reasoning_content in
+ *     non-stream responses; usage counts reasoning_tokens)
+ *   - streaming WITH stream_options.include_usage=true (finish_reason and a
+ *     final usage chunk verified; reasoning deltas are NOT streamed)
+ *   - tool calls: ONE explicitly selected function (tool_choice) works
+ *
+ *   REJECTED (HTTP 503 — gateway middleware, errors alternate between
+ *   `model_not_found`/"No available channel" and custom `intent_rejected`):
+ *   - `max_tokens` (use max_completion_tokens instead)
+ *   - streaming WITHOUT stream_options.include_usage (middleware enforces the
+ *     usage requirement instead of auto-adding it as the docs claim)
+ *   - `developer` role (system role required)
+ *   - `temperature` / `top_p` (sampling controls)
+ *   - reasoning_effort values outside the documented set (medium, and off for
+ *     GLM tiers) — matches the docs' "rejected rather than silently changed"
+ *   - tool requests with MULTIPLE tools / auto selection (the documented tool
+ *     profile is one forced function with flat arguments at effort=low)
+ *   - both max_tokens and max_completion_tokens together
+ *
+ *   OTHER OBSERVATIONS:
+ *   - unst33r-deepseek: gateway routes the request but the upstream failed with
+ *     HTTP 400 `upstream_error` during verification; streaming rejected. Treat
+ *     as non-functional for now.
+ *   - Burst sensitivity: >~2 requests in quick succession can trip
+ *     `intent_rejected` even for valid bodies.
+ *   - Output cap: max_completion_tokens is accepted up to 8192; 10240 and
+ *     above are rejected (verified). Hence MAX_OUTPUT_TOKENS below.
+ *   - FLAT MESSAGES REQUIRED: message content must be a plain string. The
+ *     OpenAI-spec array-of-blocks form (`[{"type":"text",...}]`, which pi's
+ *     openai-completions implementation sends for user messages) is rejected
+ *     with 503 — verified by replaying the same payload with only the content
+ *     shape changed. pi has no compat flag to force string content, so pi
+ *     end-to-end calls currently fail at the gateway regardless of these
+ *     flags. Nothing client-side can fix this; it needs a gateway fix (or a
+ *     future pi-side message-flattening option).
+ *   - Intent-style content middleware: prompt CONTENT is also classified.
+ *     Short/benign prompts pass; an agent-harness system prompt combined with
+ *     security-audit/exploit-hunting project instructions was rejected with
+ *     the same 503 signatures, while each part in isolation passed. Expect
+ *     occasional content-dependent rejections beyond the parameter rules.
+ *
+ * Impact on pi: metadata in this file is gateway-verified, but pi requests
+ * currently fail for two server-side reasons pi cannot influence: (1) pi
+ * sends array-form message content, the gateway wants plain strings; (2) pi's
+ * agent loop sends multiple tools without a forced tool_choice, the gateway
+ * only accepts one explicitly selected function. Chat via raw API calls with
+ * string content works (verified end-to-end).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * Compat flags shared by all three models.
- *
- * - supportsStore: false            (docs) — no store / Responses API.
- * - supportsDeveloperRole: false    (conservative) — unverified through the
- *   gateway; the system role is universally accepted by OpenAI-compatible
- *   relays, so we stay on system until probed otherwise.
- * - supportsReasoningEffort: true   (docs) — reasoning_effort documented.
- * - supportsUsageInStreaming: true  (docs) — server adds
- *   stream_options.include_usage=true when omitted (flash/pro). Harmless for
- *   deepseek, which rejects streaming outright (see its warning).
- * - supportsFinishReason: left at default (true) — unverified; flip after a
- *   check-compat.sh run if streams end without finish_reason.
- * - maxTokensField: "max_tokens"    (docs allows either; "max_tokens" is the
- *   most portable across New API upstream channels).
- * - supportsStrictMode: false       (docs) — structured outputs unsupported.
- * - thinkingFormat: "openai"        (docs) — reasoning_effort is the documented
- *   thinking control.
+ * Compat flags shared by all three models (live-verified 2026-11-06):
+ * - supportsStore: false            — no store / Responses API.
+ * - supportsDeveloperRole: false    — VERIFIED rejected (503 intent_rejected);
+ *                                     pi stays on the system role.
+ * - supportsReasoningEffort: true   — VERIFIED (low/high/max accepted).
+ * - supportsUsageInStreaming: true  — REQUIRED: the gateway 503s any stream
+ *                                     without stream_options.include_usage.
+ *                                     pi sends it when this flag is true.
+ * - maxTokensField: "max_completion_tokens" — VERIFIED: `max_tokens` is
+ *                                     rejected by the middleware; the
+ *                                     max_completion_tokens spelling works.
+ * - supportsFinishReason: default (true) — VERIFIED `stop` and `tool_calls`
+ *                                     finish reasons in responses and streams.
+ * - supportsStrictMode: false       — structured outputs unsupported.
+ * - thinkingFormat: "openai"        — reasoning_effort is the thinking control.
  */
 const SHARED_COMPAT = {
 	supportsStore: false,
 	supportsDeveloperRole: false,
 	supportsReasoningEffort: true,
 	supportsUsageInStreaming: true,
-	maxTokensField: "max_tokens",
+	maxTokensField: "max_completion_tokens",
 	supportsStrictMode: false,
 	thinkingFormat: "openai",
 } as const;
 
 /**
  * GLM-based tiers (unst33r-flash, unst33r-pro): reasoning_effort accepts
- * omitted | low | high | max. `off` is NOT in the accepted set, so thinking
- * "off" means omitting the parameter entirely (null). medium/minimal/xhigh are
- * likewise unsupported — the docs promise other values are rejected with 400,
- * never clamped.
+ * omitted | low | high | max (VERIFIED live). `off` and `medium` are rejected
+ * by the gateway (503), so they stay unmapped (null) — pi omits the parameter
+ * for unmapped levels.
  */
 const GLM_THINKING_LEVEL_MAP = {
 	off: null,
@@ -84,7 +113,8 @@ const GLM_THINKING_LEVEL_MAP = {
 } as const;
 
 /**
- * DeepSeek tier additionally accepts reasoning_effort="off".
+ * DeepSeek tier additionally accepts reasoning_effort="off" per official docs
+ * (live verification blocked by the tier's upstream failure on 2026-11-06).
  */
 const DEEPSEEK_THINKING_LEVEL_MAP = {
 	off: "off",
@@ -97,12 +127,14 @@ const DEEPSEEK_THINKING_LEVEL_MAP = {
 } as const;
 
 /**
- * Output cap: pi always sends max_tokens, and the docs warn the server default
- * is 512 tokens with "larger limits require model-specific verification". 32k
- * is comfortably above pi's per-turn needs (text + tool-call arguments) while
- * staying below any plausible upstream cap. Revisit after a live probe.
+ * Output cap: pi always sends max tokens in the max_completion_tokens spelling
+ * (see SHARED_COMPAT). The gateway middleware VERIFIES a hard cap of 8192:
+ * max_completion_tokens=8192 is accepted, 10240 and above answer 503
+ * intent_rejected (this is the concrete meaning of the docs' "larger limits
+ * require model-specific verification and configuration"). 8192 is therefore
+ * the configured cap until the gateway raises it.
  */
-const MAX_OUTPUT_TOKENS = 32768;
+const MAX_OUTPUT_TOKENS = 8192;
 
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider("unst33r", {
@@ -125,11 +157,12 @@ export default function (pi: ExtensionAPI) {
 			},
 			{
 				type: "chat",
-				// WARNING: upstream accepts non-streaming TEXT ONLY — SSE and tool
-				// calls are not enabled (official docs). pi's coding loop streams
-				// and uses tools, so this model is effectively unusable as an agent
-				// model; it is registered because it is part of the documented
-				// catalog, for one-shot/text use and future re-verification.
+				// WARNING (2026-11-06): the gateway routes this model but its
+				// upstream failed with HTTP 400 `upstream_error` during live
+				// verification, and streaming is rejected (docs: non-streaming
+				// text only, no tool calls). It is registered because it is part
+				// of the documented catalog — do not rely on it until upstream
+				// recovers; re-check with scripts/check-compat.sh --all-models.
 				id: "unst33r-deepseek",
 				name: "DeepSeek-V4.1-Flash-1017 Abliterated",
 				reasoning: true,

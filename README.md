@@ -23,25 +23,36 @@ Prices are USD per 1M tokens, from the official pricing page (catalog version `2
 
 | Model ID | Base model | Input | Output | Cached input | Context | Reasoning | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `unst33r-flash` | GLM-5.3-Flash (uncensored) | $0.50 | $1.50 | — | 1M | `low` / `high` / `max` | Fast tier; tool calls limited to one forced function |
-| `unst33r-deepseek` | DeepSeek-V4.1-Flash-1017 (abliterated) | $0.15 | $0.5625 | $0.03125 | 1M | `off` / `low` / `high` / `max` | **Non-streaming text only — no SSE, no tool calls; cannot drive pi's coding loop** |
-| `unst33r-pro` | GLM-5.3 (uncensored) | $2.50 | $4.50 | — | 1M | `low` / `high` / `max` | Flagship tier; tool calls limited to one forced function |
+| `unst33r-flash` | GLM-5.3-Flash (uncensored) | $0.50 | $1.50 | — | 1M | `low` / `high` / `max` | Fast tier; verified working 2026-11-06 |
+| `unst33r-deepseek` | DeepSeek-V4.1-Flash-1017 (abliterated) | $0.15 | $0.5625 | $0.03125 | 1M | `off` / `low` / `high` / `max` | Upstream failing (HTTP 400 `upstream_error`) as of 2026-11-06; non-streaming text only per docs — do not rely on it |
+| `unst33r-pro` | GLM-5.3 (uncensored) | $2.50 | $4.50 | — | 1M | `low` / `high` / `max` | Flagship tier; verified working 2026-11-06 |
 
 See [unst33r.si](https://unst33r.si) for authoritative pricing.
 
 ## Compatibility notes
 
-Verified against the official API docs ([unst33r.si/docs](https://unst33r.si/docs)) and encoded as pi `compat` flags in `extensions/unst33r.ts`:
+Live-verified against the gateway on 2026-11-06 with spaced single probes (`scripts/check-compat.sh`). The gateway runs a strict request middleware in front of a New API distributor; rejected requests answer HTTP 503 with alternating errors (`model_not_found` / "No available channel" and a custom `intent_rejected` / "Inference temporarily unavailable").
 
-- **Text Chat Completions only.** No Responses API, no structured outputs (`supportsStrictMode: false`), no images/audio/embeddings, no sampling controls — pi never sends `temperature`/`top_p` by default, but don't configure them for these models.
-- **`max_tokens` OR `max_completion_tokens`, never both.** This package uses `max_tokens` (`maxTokensField`). If neither is sent the server defaults output to 512 tokens — pi always sends it, so this doesn't affect you here.
-- **`reasoning_effort`** (`thinkingFormat: "openai"`): flash/pro accept omitted, `low`, `high`, `max`; deepseek also accepts `off`. Other values are rejected with HTTP 400 rather than clamped — pi's `thinkingLevelMap` therefore leaves `minimal`/`medium`/`xhigh` unmapped.
-- **Streaming usage**: the server adds `stream_options.include_usage: true` itself for flash/pro when omitted (`supportsUsageInStreaming: true`).
-- **`developer` role**: unverified through the gateway; the package conservatively keeps the `system` role (`supportsDeveloperRole: false`).
-- **Tool profile (flash/pro)**: documented as one explicitly selected function with flat string arguments at `reasoning_effort: low`. pi's agent loop sends multiple tools with auto selection — treat full agentic use as unverified until probed; the deepseek tier has no tool calling at all.
-- **`unst33r-deepseek` is non-streaming text only** (no SSE, no tool calls), so it is registered for catalog completeness and one-shot text use, not as an agent model.
+Accepted (encoded as pi `compat` flags in `extensions/unst33r.ts`):
 
-`scripts/check-compat.sh` probes all of the above against the live endpoint and prints a suggested `compat` block:
+- **Chat Completions with `max_completion_tokens`** — the legacy `max_tokens` spelling is **rejected** by the middleware; this package sets `maxTokensField: "max_completion_tokens"`.
+- **`system` role** works; the `developer` role is rejected (`supportsDeveloperRole: false`).
+- **`reasoning_effort`** (`thinkingFormat: "openai"`): flash/pro accept omitted, `low`, `high`, `max` — all verified with `reasoning_content` in non-stream responses. `off` is documented for deepseek only. Other values (`medium`, `off` on GLM tiers) are rejected; pi's `thinkingLevelMap` leaves them unmapped so pi omits the parameter.
+- **Output cap: 8192 tokens.** `max_completion_tokens` is accepted up to 8192; 10240 and above are rejected. This package sets `maxTokens: 8192` accordingly.
+- **Streaming requires `stream_options.include_usage: true`** — without it the middleware rejects the stream (it does not auto-add the flag as the docs claim). pi sends it when `supportsUsageInStreaming: true`, so this package works. `finish_reason` and a final usage chunk verified; note that **reasoning content is not exposed in stream deltas** (only counted in `usage.completion_tokens_details.reasoning_tokens`).
+- **Tool calls: one explicitly selected function** (`tool_choice`) with flat arguments — verified working, matching the documented profile.
+
+Rejected / broken (also verified):
+
+- `temperature` / `top_p` (sampling controls) — pi never sends them by default; do not configure `samplingParams` for these models.
+- Both max-field spellings together.
+- **Multiple tools with auto selection — i.e. what pi's agent loop sends — are rejected.** Only `tool_choice` forced to one named function is accepted.
+- **Array-form message content is rejected** (`[{"type":"text",...}]`): message content must be a plain string. This is stricter than the OpenAI spec, and pi's openai-completions implementation always sends array form for user messages — with no compat flag to change that. **As of 2026-11-06 this blocks pi end-to-end calls through this gateway**, independent of everything above. Raw API calls with string content work (verified end-to-end).
+- A content-based "intent" layer additionally classifies prompt text: short/benign prompts pass, but an agent-harness system prompt combined with security-audit/exploit-hunting project instructions was rejected with the same 503 signatures (each part in isolation passed). Expect occasional content-dependent rejections.
+- `unst33r-deepseek`'s upstream returned `400 upstream_error` ("Model request failed") during verification, and streaming is rejected for it per docs — treat the tier as non-functional for now.
+- Rapid-fire requests can trip the middleware into rejecting even valid bodies. Space requests ~10 seconds apart (the bundled probe script does this via `PROBE_DELAY`).
+
+Run the probe suite yourself:
 
 ```bash
 export UNST33R_API_KEY=sk-...
@@ -77,9 +88,11 @@ If you prefer not to install provider code, add this to `~/.pi/agent/models.json
 ## Roadmap
 
 - [x] Verify pricing from the official pricing page; encode reasoning support and `thinkingLevelMap`
-- [x] `compat` flags for OpenAI-compatibility differences observed at the gateway (New API deployment), from official docs
+- [x] `compat` flags verified against the live gateway (max_completion_tokens, developer role, reasoning_effort set, include_usage-required streaming, single-function tool profile, temperature rejection, 8192 output cap)
 - [x] `unst33r-setup` skill: guided key setup and connectivity check
-- [ ] Confirm context windows, output limits, and tool-calling behavior with live completion probes (`scripts/check-compat.sh`) — pending gateway channel availability
+- [ ] **Blocked server-side**: pi end-to-end traffic — the gateway rejects array-form message content (pi has no flatten option) and non-forced multi-tool requests; report both to UNST33R support and re-test after a gateway fix
+- [ ] Re-test `unst33r-deepseek` (upstream was failing 2026-11-06)
+- [ ] Confirm context windows end-to-end (metadata currently upstream-derived)
 - [ ] Dynamic model discovery (`refreshModels`) with the static catalog as fallback
 - [ ] npm publish under `@unst33r/pi` with the `pi-package` keyword
 
